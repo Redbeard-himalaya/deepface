@@ -285,6 +285,206 @@ def find(
     return resp_obj
 
 
+def find_from_db(
+    img_path: Union[str, np.ndarray],
+    db: List,
+    model_name: str = "VGG-Face",
+    distance_metric: str = "cosine",
+    enforce_detection: bool = True,
+    detector_backend: str = "opencv",
+    align: bool = True,
+    expand_percentage: int = 0,
+    threshold: Optional[float] = None,
+    normalization: str = "base",
+    silent: bool = False,
+) -> List[pd.DataFrame]:
+    """
+    Identify individuals in a database
+
+    Args:
+        img_path (str or np.ndarray): The exact path to the image, a numpy array in BGR format,
+            or a base64 encoded image. If the source image contains multiple faces, the result will
+            include information for each detected face.
+
+        db (List): list of representations
+
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace and SFace
+
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'euclidean_l2'.
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Default is True. Set to False to avoid the exception for low-resolution images.
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8'.
+
+        align (boolean): Perform alignment based on the eye positions.
+
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+
+        threshold (float): Specify a threshold to determine whether a pair represents the same
+            person or different individuals. This threshold is used for comparing distances.
+            If left unset, default pre-tuned threshold values will be applied based on the specified
+            model name and distance metric (default is None).
+
+        normalization (string): Normalize the input image before feeding it to the model.
+            Default is base. Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace
+
+        silent (boolean): Suppress or allow some log messages for a quieter analysis process.
+
+    Returns:
+        results (List[pd.DataFrame]): A list of pandas dataframes. Each dataframe corresponds
+            to the identity information for an individual detected in the source image.
+            The DataFrame columns include:
+
+            - 'identity': Identity label of the detected individual.
+
+            - 'target_x', 'target_y', 'target_w', 'target_h': Bounding box coordinates of the
+                    target face in the database.
+
+            - 'source_x', 'source_y', 'source_w', 'source_h': Bounding box coordinates of the
+                    detected face in the source image.
+
+            - 'threshold': threshold to determine a pair whether same person or different persons
+
+            - 'distance': Similarity score between the faces based on the
+                    specified model and distance metric
+    """
+
+    tic = time.time()
+
+    if not silent:
+        toc = time.time()
+        logger.info(f"start loading model {toc - tic} seconds")
+
+    # -------------------------------
+    if not isinstance(db, List):
+        raise ValueError("Passed db is not list!")
+
+    model: FacialRecognition = modeling.build_model(model_name)
+    target_size = model.input_shape
+    if not silent:
+        toc = time.time()
+        logger.info(f"load model {toc - tic} seconds")
+
+    # ---------------------------------------
+
+    representations = db
+
+    # required columns for representations
+    df_cols = [
+        "identity",
+        "hash",
+        "embedding",
+        "target_x",
+        "target_y",
+        "target_w",
+        "target_h",
+    ]
+
+    # check each item of representations list has required keys
+    for i, current_representation in enumerate(representations):
+        missing_keys = list(set(df_cols) - set(current_representation.keys()))
+        if len(missing_keys) > 0:
+            raise ValueError(
+                f"{i}-th item does not have some required keys - {missing_keys}."
+                f"Consider to delete {datastore_path}"
+            )
+
+
+    # Should we have no representations bailout
+    if len(representations) == 0:
+        if not silent:
+            toc = time.time()
+            logger.info(f"find function duration {toc - tic} seconds")
+        return []
+
+    # ----------------------------
+    # now, we got representations for facial database
+    df = pd.DataFrame(representations)
+
+    if silent is False:
+        logger.info(f"Searching {img_path} in {df.shape[0]} length datastore")
+
+    # img path might have more than once face
+    source_objs = detection.extract_faces(
+        img_path=img_path,
+        target_size=target_size,
+        detector_backend=detector_backend,
+        grayscale=False,
+        enforce_detection=enforce_detection,
+        align=align,
+        expand_percentage=expand_percentage,
+    )
+
+    resp_obj = []
+
+    for source_obj in source_objs:
+        source_img = source_obj["face"]
+        source_region = source_obj["facial_area"]
+        target_embedding_obj = representation.represent(
+            img_path=source_img,
+            model_name=model_name,
+            enforce_detection=enforce_detection,
+            detector_backend="skip",
+            align=align,
+            normalization=normalization,
+        )
+
+        target_representation = target_embedding_obj[0]["embedding"]
+
+        result_df = df.copy()  # df will be filtered in each img
+        result_df["source_x"] = source_region["x"]
+        result_df["source_y"] = source_region["y"]
+        result_df["source_w"] = source_region["w"]
+        result_df["source_h"] = source_region["h"]
+
+        distances = []
+        for _, instance in df.iterrows():
+            source_representation = instance["embedding"]
+            if source_representation is None:
+                distances.append(float("inf"))  # no representation for this image
+                continue
+
+            target_dims = len(list(target_representation))
+            source_dims = len(list(source_representation))
+            if target_dims != source_dims:
+                raise ValueError(
+                    "Source and target embeddings must have same dimensions but "
+                    + f"{target_dims}:{source_dims}. Model structure may change"
+                    + " after pickle created. Delete the {file_name} and re-run."
+                )
+
+            distance = verification.find_distance(
+                source_representation, target_representation, distance_metric
+            )
+
+            distances.append(distance)
+
+            # ---------------------------
+        target_threshold = threshold or verification.find_threshold(model_name, distance_metric)
+
+        result_df["threshold"] = target_threshold
+        result_df["distance"] = distances
+
+        result_df = result_df.drop(columns=["embedding"])
+        # pylint: disable=unsubscriptable-object
+        result_df = result_df[result_df["distance"] <= target_threshold]
+        result_df = result_df.sort_values(by=["distance"], ascending=True).reset_index(drop=True)
+
+        resp_obj.append(result_df)
+
+    # -----------------------------------
+
+    if not silent:
+        toc = time.time()
+        logger.info(f"find function duration {toc - tic} seconds")
+
+    return resp_obj
+
+
 def __list_images(path: str) -> List[str]:
     """
     List images in a given path
