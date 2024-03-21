@@ -176,7 +176,7 @@ def find(
 
     # find representations for new images
     if len(new_images) > 0:
-        representations += __find_bulk_embeddings(
+        representations += find_bulk_embeddings(
             employees=new_images,
             model_name=model_name,
             target_size=target_size,
@@ -502,7 +502,7 @@ def __list_images(path: str) -> List[str]:
     return images
 
 
-def __find_bulk_embeddings(
+def find_bulk_embeddings(
     employees: List[str],
     model_name: str = "VGG-Face",
     target_size: tuple = (224, 224),
